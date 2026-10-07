@@ -1,0 +1,275 @@
+diff --git a/src/audio.cpp b/src/audio.cpp
+index 28a3d810..f20f5687 100644
+--- a/src/audio.cpp
++++ b/src/audio.cpp
+@@ -3,6 +3,7 @@
+  * @brief Definitions for audio capture and encoding.
+  */
+ // standard includes
++#include <mutex>
+ #include <thread>
+ 
+ // lib includes
+@@ -32,6 +33,11 @@ namespace audio {
+   static void stop_audio_control(audio_ctx_t &);
+   static void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params);
+ 
++  /**
++   * @brief Serializes (re)connecting the shared audio control between sessions.
++   */
++  static std::mutex control_mutex;
++
+   /**
+    * @brief Select the Opus stream configuration for a channel count and quality tier.
+    *
+@@ -152,49 +158,34 @@ namespace audio {
+   }
+ 
+   /**
+-   * @brief Run the capture loop for this backend.
++   * @brief Connect to the audio server if needed, select the sink, and open the capture stream.
++   *
++   * @param opened_on Set to the audio control the capture stream was opened on.
++   * @return Capture stream, or nullptr if the audio server is not available (yet).
+    */
+-  void capture(safe::mail_t mail, config_t config, void *channel_data) {
+-    auto shutdown_event = mail->event<bool>(mail::shutdown);
+-    if (!config::audio.stream) {
+-      shutdown_event->view();
+-      return;
+-    }
+-    auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
+-    if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
+-      apply_surround_params(stream, config.customStreamParams);
+-    }
+-
+-    auto ref = get_audio_ctx_ref();
+-    if (!ref) {
+-      return;
+-    }
+-
+-    auto init_failure_fg = util::fail_guard([&shutdown_event]() {
+-      BOOST_LOG(error) << "Unable to initialize audio capture. The stream will not have audio."sv;
+-
+-      // Wait for shutdown to be signalled if we fail init.
+-      // This allows streaming to continue without audio.
+-      shutdown_event->view();
+-    });
++  static std::unique_ptr<platf::mic_t> open_mic(audio_ctx_t &ctx, const opus_stream_config_t &stream, const config_t &config, int frame_size, const platf::audio_control_t *&opened_on) {
++    std::lock_guard lg {control_mutex};
+ 
+-    auto &control = ref->control;
+-    if (!control) {
+-      return;
++    if (!ctx.control) {
++      start_audio_control(ctx);
++      if (!ctx.control) {
++        return nullptr;
++      }
+     }
++    auto &control = ctx.control;
+ 
+     // Order of priority:
+     // 1. Virtual sink
+     // 2. Audio sink
+     // 3. Host
+-    std::string *sink = &ref->sink.host;
++    std::string *sink = &ctx.sink.host;
+     if (!config::audio.sink.empty()) {
+       sink = &config::audio.sink;
+     }
+ 
+     // Prefer the virtual sink if host playback is disabled or there's no other sink
+-    if (ref->sink.null && (!config.flags[config_t::HOST_AUDIO] || sink->empty())) {
+-      auto &null = *ref->sink.null;
++    if (ctx.sink.null && (!config.flags[config_t::HOST_AUDIO] || sink->empty())) {
++      auto &null = *ctx.sink.null;
+       switch (stream.channelCount) {
+         case 2:
+           sink = &null.stereo;
+@@ -208,27 +199,66 @@ namespace audio {
+       }
+     }
+ 
+-    // Only the first to start a session may change the default sink
+-    if (!ref->sink_flag->exchange(true, std::memory_order_acquire)) {
++    // Only the first to start a session may change the default sink.
++    // The flag is only set once the change succeeded, so a retry tries again.
++    if (!ctx.sink_flag->load(std::memory_order_acquire)) {
+       // If the selected sink is different than the current one, change sinks.
+-      ref->restore_sink = ref->sink.host != *sink;
+-      if (ref->restore_sink) {
+-        if (control->set_sink(*sink)) {
+-          return;
+-        }
++      ctx.restore_sink = ctx.sink.host != *sink;
++      if (ctx.restore_sink && control->set_sink(*sink)) {
++        ctx.restore_sink = false;
++        // The connection may be dead; reconnect on the next attempt.
++        control.reset();
++        return nullptr;
+       }
++      ctx.sink_flag->store(true, std::memory_order_release);
+     }
+ 
+-    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+     bool host_audio = config.flags[config_t::HOST_AUDIO];
+     bool continuous_audio = config.flags[config_t::CONTINUOUS_AUDIO];
+     auto mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
+     if (!mic) {
++      // The connection may be dead; reconnect on the next attempt.
++      control.reset();
++      return nullptr;
++    }
++
++    opened_on = control.get();
++    return mic;
++  }
++
++  /**
++   * @brief Drop the shared audio control so the next open reconnects.
++   *
++   * @param control The audio control a failed capture stream was opened on. If another
++   * session already replaced it, it is left alone so sessions don't undo each other.
++   */
++  static void drop_control(audio_ctx_t &ctx, const platf::audio_control_t *control) {
++    std::lock_guard lg {control_mutex};
++    if (ctx.control.get() == control) {
++      ctx.control.reset();
++    }
++  }
++
++  /**
++   * @brief Run the capture loop for this backend.
++   */
++  void capture(safe::mail_t mail, config_t config, void *channel_data) {
++    auto shutdown_event = mail->event<bool>(mail::shutdown);
++    if (!config::audio.stream) {
++      shutdown_event->view();
++      return;
++    }
++    auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
++    if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
++      apply_surround_params(stream, config.customStreamParams);
++    }
++
++    auto ref = get_audio_ctx_ref();
++    if (!ref) {
+       return;
+     }
+ 
+-    // Audio is initialized, so we don't want to print the failure message
+-    init_failure_fg.disable();
++    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+ 
+     // Capture takes place on this thread
+     platf::adjust_thread_priority(platf::thread_priority_e::critical);
+@@ -245,7 +275,28 @@ namespace audio {
+ 
+     int samples_per_frame = frame_size * stream.channelCount;
+ 
++    // The audio server may not exist yet (e.g. no user session before login) or may
++    // go away mid-stream (logout), so keep retrying instead of giving up on audio.
++    std::unique_ptr<platf::mic_t> mic;
++    const platf::audio_control_t *mic_control = nullptr;
++    bool warned = false;
+     while (!shutdown_event->peek()) {
++      if (!mic) {
++        mic = open_mic(*ref.get(), stream, config, frame_size, mic_control);
++        if (!mic) {
++          if (!warned) {
++            BOOST_LOG(warning) << "Audio capture unavailable, retrying every 5 seconds"sv;
++            warned = true;
++          }
++          shutdown_event->view(5s);
++          continue;
++        }
++        if (warned) {
++          BOOST_LOG(info) << "Audio capture initialized"sv;
++          warned = false;
++        }
++      }
++
+       std::vector<float> sample_buffer;
+       sample_buffer.resize(samples_per_frame);
+ 
+@@ -258,15 +309,13 @@ namespace audio {
+         case platf::capture_e::reinit:
+           BOOST_LOG(info) << "Reinitializing audio capture"sv;
+           mic.reset();
+-          do {
+-            mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
+-            if (!mic) {
+-              BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
+-            }
+-          } while (!mic && !shutdown_event->view(5s));
+           continue;
+         default:
+-          return;
++          BOOST_LOG(warning) << "Audio capture lost, reconnecting to the audio server"sv;
++          mic.reset();
++          drop_control(*ref.get(), mic_control);
++          shutdown_event->view(5s);
++          continue;
+       }
+ 
+       samples->raise(std::move(sample_buffer));
+@@ -336,7 +385,7 @@ namespace audio {
+ 
+   void stop_audio_control(audio_ctx_t &ctx) {
+     // restore audio-sink if applicable
+-    if (!ctx.restore_sink) {
++    if (!ctx.restore_sink || !ctx.control) {
+       return;
+     }
+ 
+diff --git a/src/platform/linux/audio.cpp b/src/platform/linux/audio.cpp
+index fe246bff..1f838a26 100644
+--- a/src/platform/linux/audio.cpp
++++ b/src/platform/linux/audio.cpp
+@@ -408,6 +408,11 @@ namespace platf {
+           pa_context_unload_module(ctx.get(), i, success_cb, alarm.get())
+         };
+ 
++        // The server is gone (e.g. on logout); waiting would block forever.
++        if (!op) {
++          return -1;
++        }
++
+         alarm->wait();
+ 
+         if (*alarm->status()) {
+@@ -540,6 +545,10 @@ namespace platf {
+         };
+ 
+         op_t server_op {pa_context_get_server_info(ctx.get(), cb<pa_server_info *>, &server_f)};
++        // The server is gone; waiting would block forever.
++        if (!server_op) {
++          return sink_name;
++        }
+         alarm->wait();
+         // No need to check status. If it failed just return default name.
+         return sink_name;
+@@ -575,6 +584,10 @@ namespace platf {
+         };
+ 
+         op_t sink_op {pa_context_get_sink_info_by_name(ctx.get(), sink_name.c_str(), cb<pa_sink_info *>, &sink_f)};
++        // The server is gone; waiting would block forever.
++        if (!sink_op) {
++          return monitor_name;
++        }
+ 
+         alarm->wait();
+         // No need to check status. If it failed just return default name.
+@@ -594,6 +607,11 @@ namespace platf {
+        * @return Microphone capture object for the requested audio layout.
+        */
+       std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, [[maybe_unused]] bool host_audio_enabled) override {
++        // A dead connection (e.g. after logout) can't look up the monitor source.
++        if (pa_context_get_state(ctx.get()) != PA_CONTEXT_READY) {
++          return nullptr;
++        }
++
+         // Sink choice priority:
+         // 1. Config sink
+         // 2. Last sink swapped to (Usually virtual in this case)
