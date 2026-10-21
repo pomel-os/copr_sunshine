@@ -224,10 +224,22 @@ index 28a3d810..f20f5687 100644
      }
  
 diff --git a/src/platform/linux/audio.cpp b/src/platform/linux/audio.cpp
-index fe246bff..1f838a26 100644
+index fe246bff..122a47cc 100644
 --- a/src/platform/linux/audio.cpp
 +++ b/src/platform/linux/audio.cpp
-@@ -408,6 +408,11 @@ namespace platf {
+@@ -358,8 +358,9 @@ namespace platf {
+           loop.get()
+         };
+ 
+-        auto event = events->pop();
+-        if (event == failed) {
++        // Bounded: a socket that accepts but never answers (e.g. during logout) would block forever.
++        auto event = events->pop(5s);
++        if (event != ready) {
+           return -1;
+         }
+ 
+@@ -408,6 +409,11 @@ namespace platf {
            pa_context_unload_module(ctx.get(), i, success_cb, alarm.get())
          };
  
@@ -239,7 +251,7 @@ index fe246bff..1f838a26 100644
          alarm->wait();
  
          if (*alarm->status()) {
-@@ -540,6 +545,10 @@ namespace platf {
+@@ -540,6 +546,10 @@ namespace platf {
          };
  
          op_t server_op {pa_context_get_server_info(ctx.get(), cb<pa_server_info *>, &server_f)};
@@ -250,7 +262,7 @@ index fe246bff..1f838a26 100644
          alarm->wait();
          // No need to check status. If it failed just return default name.
          return sink_name;
-@@ -575,6 +584,10 @@ namespace platf {
+@@ -575,6 +585,10 @@ namespace platf {
          };
  
          op_t sink_op {pa_context_get_sink_info_by_name(ctx.get(), sink_name.c_str(), cb<pa_sink_info *>, &sink_f)};
@@ -261,7 +273,7 @@ index fe246bff..1f838a26 100644
  
          alarm->wait();
          // No need to check status. If it failed just return default name.
-@@ -594,6 +607,11 @@ namespace platf {
+@@ -594,6 +608,11 @@ namespace platf {
         * @return Microphone capture object for the requested audio layout.
         */
        std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, [[maybe_unused]] bool host_audio_enabled) override {
@@ -273,3 +285,22 @@ index fe246bff..1f838a26 100644
          // Sink choice priority:
          // 1. Config sink
          // 2. Last sink swapped to (Usually virtual in this case)
+@@ -659,11 +678,14 @@ namespace platf {
+         unload_null(index.surround71);
+ 
+         if (worker.joinable()) {
+-          pa_context_disconnect(ctx.get());
++          // A failed context emits no further events, so only wait on a live one.
++          if (PA_CONTEXT_IS_GOOD(pa_context_get_state(ctx.get()))) {
++            pa_context_disconnect(ctx.get());
+ 
+-          KITTY_WHILE_LOOP(auto event = events->pop(), event != terminated && event != failed, {
+-            event = events->pop();
+-          })
++            KITTY_WHILE_LOOP(auto event = events->pop(), event != terminated && event != failed, {
++              event = events->pop();
++            })
++          }
+ 
+           pa_mainloop_quit(loop.get(), 0);
+           worker.join();
